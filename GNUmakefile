@@ -1,6 +1,6 @@
 #=========================================================================================
-# GNUmakefile for GCC 3.01.                                                               
-# Copyright 2001 MillenniumIT Software.                                                   
+# GNUmakefile for GCC 3.01.                                                            
+                                          
 #=========================================================================================
 
 # The options in this file will depend on the options selected during its creation.       
