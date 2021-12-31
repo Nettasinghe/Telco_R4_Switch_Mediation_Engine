@@ -1,0 +1,1128 @@
+
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <oraca.h>
+#include <sqlcpr.h>
+#include <sqlda.h>
+#include <sqlca.h>
+
+//#include "defines.h"				// CJN
+#define CDR_INSERT_BLOCK_SIZE 1000	// CJN
+
+
+#ifndef ORA_PROC
+#include "db.h"
+#include "db_data_containers.h"
+#include "cdr.h"
+#include <fstream>
+#endif
+
+
+extern rated_cdr *gsm_rated_cdr;
+extern rated_cdr *gsm_cdr_block;
+extern rated_cdr *gsm_error_cdr_block;
+extern rated_cdr *gsm_no_charge_cdr_block;
+extern dyn_7_udr *gsm_dyn_7_udr;
+extern dyn_7_udr *gsm_dyn_7_udr_block;
+extern char debug_option[128];
+extern int array_insert_size;
+extern int global_cdr_counter;
+extern int global_no_charge_cdr_counter;
+extern ofstream f_log;
+
+
+#define BUF_LEN 	100
+#define FETCH_SIZE	1000
+#define BUF_LENTH	20		
+
+
+EXEC SQL DECLARE CDR DATABASE; 
+EXEC SQL DECLARE RATING DATABASE;
+
+
+EXEC SQL BEGIN DECLARE SECTION;
+	char *login;
+EXEC SQL END DECLARE SECTION;
+
+
+void sql_error(char *msg)
+{
+	cout << endl << msg << endl;
+	f_log << msg << endl;
+	sqlca.sqlerrm.sqlerrmc[sqlca.sqlerrm.sqlerrml] = '\0';
+	oraca.orastxt.orastxtc[oraca.orastxt.orastxtl] = '\0';
+	oraca.orasfnm.orasfnmc[oraca.orasfnm.orasfnml] = '\0';
+	cout << sqlca.sqlerrm.sqlerrmc << endl;
+	f_log << sqlca.sqlerrm.sqlerrmc << endl;
+	cout << "in " << oraca.orastxt.orastxtc << endl;
+	f_log << "in " << oraca.orastxt.orastxtc << endl;
+	cout << "on line " << oraca.oraslnr << " of " << oraca.orasfnm.orasfnmc
+		<< endl << endl;
+	f_log << "on line " << oraca.oraslnr << " of " << oraca.orasfnm.orasfnmc
+		<< endl << endl;
+	
+	//-- Roll back any pending changes and disconnect from Oracle.
+	EXEC SQL ROLLBACK RELEASE;
+	exit(1);
+}
+
+
+//-- Connect to ORACLE. 
+void db_connect(char *in_login)
+{
+	login = in_login;  // a pointer assignment, in_login has the space acclocation
+
+    EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error--");
+
+	//cout<<"\nConnecting to ORACLE  as: "<<login<<endl;
+	cout<<"\nConnecting to ORACLE"  <<endl;
+	f_log << "Connecting to ORACLE" << endl;
+ 
+    EXEC SQL CONNECT :login;
+	EXEC SQL ALTER SESSION SET NLS_DATE_FORMAT="DD/MM/YYYY HH24:MI:SS"; 
+	cout<<"Connected  to Database"<<endl<<endl; 
+
+}
+
+
+
+void db_disconnect()
+{
+	cout<<"\nORACLE  database: DISCONNECT"<<endl;
+	f_log << "ORACLE  database: DISCONNECT"<<endl;
+	EXEC SQL COMMIT WORK RELEASE; 
+}	
+
+
+
+
+// get cdr files
+void cdr_files::db_read()
+{
+	EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error - cdr_files::db_read()");
+
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct cdr_file_t
+	{ 
+		char file_name[BUF_LEN];		// varchar2(123)
+		int file_id;					// called id_no in table number(9)
+		char transfer_date[BUF_LEN];	// date
+	} a[FETCH_SIZE]; 
+	int rows_to_fetch, rows_before, rows_this_time; 
+
+	EXEC SQL END DECLARE SECTION;
+
+	int i;
+
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				// previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE;
+	 
+	EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error: in cdr_files::db_read()");
+
+    EXEC SQL DECLARE c_cdr_file CURSOR FOR 
+
+	SELECT	FILE_NAME,  CDR_FILE_ID_NO, TRANSFER_DATE
+	FROM	sys_cdr_dump_files
+	WHERE DECODED_DATE IS NULL;
+       
+    EXEC SQL OPEN c_cdr_file; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE;
+	EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error: in cdr_files::db_read()"); 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL FETCH c_cdr_file INTO :a; 		 
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d to_fetch=%d\n", rows_this_time, rows_before, rows_to_fetch);
+
+
+		cdr_file_statistics cd;
+		cd.init();
+		for(i=0; i<rows_this_time; i++)
+		{
+			cd.file_id = a[i].file_id;
+			cd.file_name = a[i].file_name;
+			cd.transfer_date = a[i].transfer_date;			
+			insert(a[i].file_name, cd);
+		}
+	} 
+
+    EXEC SQL CLOSE c_cdr_file; 
+ 
+    printf("\n %d  cdr files loaded.\n\n",rows_before);
+	f_log << rows_before << " cdr files loaded" << endl;
+}
+
+
+
+void cdr_files::db_update(cdr_file_statistics s)
+{
+	EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error - cdr_files::db_update(cdr_file_statistics s)");
+	
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct cdr_file_t
+	{ 
+		 int valid_cdr_count;					//  number(7)
+		 int error_count;						//	number(7)
+		 int bytes_read;						//	number(9)
+		 char first_cdr_date[BUF_LENTH];		//	varchar2(14)
+		 char last_cdr_date[BUF_LENTH];			//	varchar2(14)
+		 int rating_duration;
+		 char rating_start_date[BUF_LENTH];		//	varchar2(14)
+ 		 int no_charge_records;					//	number(7)
+
+		 int id_no;								//	number(9)
+ 	} a; 
+
+	EXEC SQL END DECLARE SECTION;
+
+	
+
+	 cout << "a.id_no :" <<a.id_no<<endl;
+	 cout <<"s.file_id : "<<s.file_id<<endl;
+	 a.id_no = s.file_id;
+	 cout << "a.id_no :" <<a.id_no<<endl;
+	 cout <<"s.file_id : "<<s.file_id<<endl;
+
+	 //a.valid_cdr_count = s.valid_cdr_count;
+	 a.valid_cdr_count = global_cdr_counter;
+	 a.error_count = s.error_count;
+	 a.bytes_read = s.bytes_read;
+	 strcpy(a.first_cdr_date, s.first_cdr_date.c_str());
+	 strcpy(a.last_cdr_date, s.last_cdr_date.c_str());
+	 a.rating_duration = s.rating_duration;
+	 strcpy(a.rating_start_date, s.rating_start_date.c_str());
+	 a.no_charge_records = global_no_charge_cdr_counter;
+
+	 if ( (strcmp(debug_option,"ON"))==0 ) 
+	 {
+	 	cout << "valid cdr count : " << a.valid_cdr_count << endl;
+	 	cout << "error counrt    : " << a.error_count << endl;
+	 	cout << "bytes read      : " << a.bytes_read << endl;
+	 	cout << "first cdr date   : " << a.first_cdr_date << endl;
+	 	cout << "last cdr date   : " << a.last_cdr_date << endl;
+	 	cout << "no_charge_records  : " << a.no_charge_records << endl;
+	  }
+	 
+	 	
+
+	 EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error - cdr_files::db_update(cdr_file_statistics s)");
+	 EXEC SQL	
+	 UPDATE sys_cdr_dump_files
+	 SET 
+		valid_cdr_count			= :a.valid_cdr_count, 
+		error_count				= :a.error_count,
+		bytes_read				= :a.bytes_read,
+		first_cdr_date			= to_date(:a.first_cdr_date,'YYYYMMDDHH24MISS'),
+		last_cdr_date			= to_date(:a.last_cdr_date,'YYYYMMDDHH24MISS'),
+		//rating_duration			= :a.rating_duration,
+		//decoded_date		= to_date(:a.rating_start_date,'YYYYMMDDHH24MISS')
+		decoded_date		= SYSDATE,
+		no_charge_records	= :a.no_charge_records
+	 WHERE cdr_file_id_no  = :a.id_no;
+
+	 EXEC SQL COMMIT;
+ 
+    printf("\n cdr file id=%d log updated.\n\n", s.file_id);
+	return;
+
+	printf("\n <ERROR> file id = %d  not found to update.\n\n", s.file_id);
+}		
+
+
+void db_insert_rated_cdr(int cdr_count)
+{
+	EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error - db_insert_rated_cdr(int cdr_count)");
+
+	EXEC SQL BEGIN DECLARE SECTION;
+	
+	static struct db_cdr
+	{
+		char imsi[BUF_LEN]; 						//	varchar2(20)
+		char call_type_id[BUF_LEN];					//	varchar2(10)
+		char day_type_id[1];						//	varchar2(5)
+		char bearer_capability[BUF_LEN];			//	varchar2(10)
+		char region_code_id[1];						// varchar2(5)
+		char imei[BUF_LEN]; 						//  varchar2(20)
+		char network_group_id[1];					//	varchar2(5)
+		int locale_id;								//	number(3)
+		int cell_id; 								// number(5)
+		int duration;								//	number(9)
+		char route_group_id[1];						//	varchar2(5)
+ 		char network_id[BUF_LEN];					//	varchar2(5)
+		char msc_identity[BUF_LEN]; 				//	varchar2(20)
+		char mnc[BUF_LEN];							// varchar2(3)
+		int lac;									// number(5)
+		int termination_type;						//	number(3)
+		char call_partner[BUF_LEN];					//	varchar2(20)
+		char link_information[BUF_LEN];				// varchar2(20)
+		char ms_location[BUF_LEN];					//	varchar2(20)
+		int bearer_service; 						//	number(3)
+		int charging_indicator; 					// number(2)
+		char mcc[BUF_LEN];							// varchar2(5)
+		int service_type_id;						//	number(3)
+		int file_id;								//  number(9)
+		int file_pos;								//	number(9)
+		char call_time[BUF_LEN];					//	date
+		int roam;									//  number(1)
+		int call_partner_ext;						//  number(3)
+		char	mediated_time[BUF_LEN];				//	date			- sysdate
+	} *a;
+	
+	char	med_system_date[20]; 
+	
+	int rows_to_insert;
+	
+	EXEC SQL END DECLARE SECTION;
+	rows_to_insert = cdr_count;
+	
+	if((a = new db_cdr[array_insert_size])==NULL)
+	{
+		cout<<" cant allocate memory for cdr insert"<<endl;
+		exit(0);
+	}
+	
+	
+	for(int j=0; j<array_insert_size; j++)
+	{
+		a[j].file_pos = 0;
+	}
+	
+	for(int i=0; i<rows_to_insert; i++)
+	{
+		strcpy(a[i].imsi, gsm_cdr_block[i].mobile_subscriber_identity.substr(0,20).c_str());          
+		strcpy(a[i].call_type_id,  gsm_cdr_block[i].call_type_id.c_str());   
+		a[i].day_type_id[0]='\0';
+		strcpy(a[i].bearer_capability, gsm_cdr_block[i].required_bearer_capability.c_str());
+		a[i].region_code_id[0]='\0';
+		strcpy(a[i].imei, gsm_cdr_block[i].mobile_station_identity.substr(0,20).c_str());  
+		a[i].network_group_id[0]='\0';
+		a[i].locale_id = gsm_cdr_block[i].origin_of_call_indicator;  
+		a[i].cell_id = gsm_cdr_block[i].ci;
+		a[i].duration = gsm_cdr_block[i].call_duration;
+		a[i].route_group_id[0]='\0';
+		strcpy(a[i].network_id, gsm_cdr_block[i].call_partner_network_id.substr(0,5).c_str());  
+		strcpy(a[i].msc_identity, gsm_cdr_block[i].msc_identity.substr(0,20).c_str());
+		strcpy(a[i].mnc, gsm_cdr_block[i].mnc.c_str());                                                                                     
+	    a[i].lac = gsm_cdr_block[i].lac;
+		a[i].termination_type  = gsm_cdr_block[i].call_termination_type;
+		strcpy(a[i].call_partner,gsm_cdr_block[i].db_call_partner_identity.substr(0,20).c_str()); 
+		strcpy(a[i].link_information, gsm_cdr_block[i].link_information.c_str());
+		strcpy(a[i].ms_location, gsm_cdr_block[i].ms_location_identity.substr(0,20).c_str() );
+		a[i].bearer_service = gsm_cdr_block[i].required_bearer_service;
+		a[i].charging_indicator = gsm_cdr_block[i].charging_indicator; 
+		strcpy(a[i].mcc, gsm_cdr_block[i].mcc.c_str()); 
+		a[i].service_type_id = gsm_cdr_block[i].int_decoded_service;
+		a[i].file_id =  gsm_cdr_block[i].file_id;                                                                                           
+	    a[i].file_pos = gsm_cdr_block[i].file_pos;  
+
+		reng_date d=gsm_cdr_block[i].d_circuit_allocation_date;                                                                             
+		reng_time t=gsm_cdr_block[i].d_circuit_allocation_time;                                                                             
+	    char buf[100];                                                                                                                      
+	    sprintf(buf,"%02d%s%02d%s%04d%s%02d%s%02d%s%02d",d.day,"/",d.month,"/",d.year," ",t.hour,":",t.min,":",t.second);                   
+	    strcpy(a[i].call_time, buf);      
+
+		a[i].roam =   gsm_cdr_block[i].roam; 
+		a[i].call_partner_ext = gsm_cdr_block[i].true_cpe;
+
+		//EXEC SQL
+		//select sysdate into :a[i].mediated_time from dual;
+
+
+		if ( (strcmp(debug_option,"ON"))==0 )
+		{
+			cout <<"imsi			:" << a[i].imsi 				<< endl;
+			cout <<"call_type_id	:" << a[i].call_type_id 		<< endl;
+			cout <<"day_type_id		:" << a[i].day_type_id 			<< "should be null"	<<	endl;
+			cout <<"bearer_capability:"<< a[i].bearer_capability	<< endl;
+			cout <<"region_code_id	:" << a[i].region_code_id		<< "should be null"	<<	endl;
+			cout <<"imei			:" << a[i].imei					<< endl;
+			cout <<"network_group_id:" << a[i].network_group_id		<< "should be null"	<<	endl;
+			cout <<"locale_id		:" << a[i].locale_id			<< endl;
+			cout <<"cell_id			:" << a[i].cell_id				<< endl;
+			cout <<"duration		:" << a[i].duration				<< endl;
+			cout <<"route_group_id	:" << a[i].route_group_id		<< "should be null"	<<	endl;
+			cout <<"network_id		:" << a[i].network_id			<< endl;
+			cout <<"msc_identity	:" << a[i].msc_identity			<< endl;
+			cout <<"mnc				:" << a[i].mnc					<< endl;
+			cout <<"lac				:" << a[i].lac					<< endl;
+			cout <<"termination_type:" << a[i].termination_type		<< endl;
+			cout <<"call_Partner	:" << a[i].call_partner			<< endl;
+			cout <<"link_information:" << a[i].link_information 	<< endl;
+			cout <<"ms_location		:" << a[i].ms_location			<< endl;
+			cout <<"bearer_service	:" << a[i].bearer_service		<< endl;
+			cout <<"charging_indicator	:" << a[i].charging_indicator		<< endl;
+			cout <<"mcc				:" << a[i].mcc					<< endl;
+			cout <<"service_type_id	:" << a[i].service_type_id		<< endl;
+			cout <<"file_id			:" << a[i].file_id				<< endl;
+			cout <<"file_pos		:" << a[i].file_pos				<< endl;
+			cout <<"call_time		:" << a[i].call_time			<< endl;
+			cout <<"roam			:" << a[i].roam					<< endl;
+			cout <<"call_partner_ext:" << a[i].call_partner_ext		<< endl;
+			//cout <<"mediated_time	:" << a[i].mediated_time		<< endl;
+		}
+	}
+
+	EXEC SQL
+	select sysdate into :med_system_date from dual;
+	
+	for(int k=0; k<array_insert_size; k++)
+	{
+		strcpy(a[k].mediated_time, med_system_date);
+	} 
+
+	EXEC SQL  FOR :rows_to_insert  INSERT INTO DYN_1_UDR (
+		imsi, 
+		call_type_id, 
+		day_type_id, 
+		bearer_capability, 
+		region_code_id, 
+		imei, 
+		network_group_id, 
+		locale_id, 
+		cell_id, 
+		duration, 
+		route_group_id, 
+		network_id, 
+		msc_identity, 
+		mnc, 
+		lac, 
+		termination_type, 
+		call_partner, 
+		link_information, 
+		ms_location, 
+		bearer_service, 
+		charging_indicator, 
+		mcc, 
+		service_type_id, 
+		file_id, 
+		file_pos, 
+		call_time, 
+		roam,
+		call_partner_ext,
+		mediated_time
+	) VALUES (:a);
+	
+	
+	EXEC SQL COMMIT;
+	delete a;
+	
+}
+
+
+
+
+
+void call_partner_networks::db_read()
+{
+	EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error - call_partner_networks::db_read()");
+
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct network_number 
+	{ 
+		char	network_id[BUF_LEN]; 
+		int 	locale_id; 
+		
+	} a, *n_n_ptr; 
+	int i;
+	EXEC SQL END DECLARE SECTION;
+	
+	n_n_ptr = &a;
+	
+	EXEC SQL  DECLARE c_call_partner_network CURSOR FOR 
+		SELECT NETWORK_ID, LOCALE_ID
+		FROM MEDV_NETWORKS; 
+	
+	EXEC SQL OPEN   c_call_partner_network; 
+	
+	EXEC SQL WHENEVER NOT FOUND DO break; 
+	
+	for (i=0; ;i++) 
+	{ 
+		EXEC SQL FETCH c_call_partner_network INTO :n_n_ptr; 
+		insert(n_n_ptr->network_id, n_n_ptr->locale_id);
+	} 
+	
+	EXEC SQL  CLOSE c_call_partner_network; 
+	
+	cout<<setw(8)<<i<<" call partner network's loaded."<<endl;
+	f_log<<setw(8)<<i<<" call partner network's loaded."<<endl;
+}
+
+
+void vm_call_partners::db_read()
+{
+    EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error - vm_call_partners::db_read()");
+
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct vm_call_partner 
+	{ 
+		char	call_partner[BUF_LEN]; 
+	} a, *vm_cp_ptr; 
+
+	int i;
+	EXEC SQL END DECLARE SECTION;
+	
+	vm_cp_ptr = &a;
+	
+	EXEC SQL  DECLARE c_vm_call_partner CURSOR FOR 
+		SELECT CALL_PARTNER
+		FROM MED_VM_CALL_PARTNERS; 
+	
+	EXEC SQL OPEN   c_vm_call_partner; 
+	
+	EXEC SQL WHENEVER NOT FOUND DO break; 
+	
+	for (i=0; ;i++) 
+	{ 
+		EXEC SQL FETCH c_vm_call_partner INTO :vm_cp_ptr; 
+		insert(vm_cp_ptr->call_partner);
+	} 
+	
+	EXEC SQL  CLOSE c_vm_call_partner; 
+	
+	cout<<setw(8)<<i<<" voice mail call partner numbers loaded."<<endl;
+	f_log<<setw(8)<<i<<" voice mail call partner numbers loaded."<<endl;
+}
+
+void dyn_7_udr::db_read_med_dialog_service_centers()
+{
+	EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error - db_read_med_dialog_service_centers()");
+
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct dialog_service_center 
+	{ 
+		char	service_center[BUF_LEN]; 
+	} a, *dialog_service_center_ptr; 
+
+	int i;
+	EXEC SQL END DECLARE SECTION;
+	
+	dialog_service_center_ptr = &a;
+	
+	EXEC SQL  DECLARE c_dialog_service_center CURSOR FOR 
+		SELECT SERVICE_CENTER
+		FROM MED_DIALOG_SERVICE_CENTERS; 
+	
+	EXEC SQL OPEN   c_dialog_service_center; 
+	
+	EXEC SQL WHENEVER NOT FOUND DO break; 
+	
+	for (i=0; ;i++) 
+	{ 
+		EXEC SQL FETCH c_dialog_service_center INTO :dialog_service_center_ptr; 
+		insert_dialog_service_centers(dialog_service_center_ptr->service_center);
+	} 
+	
+	EXEC SQL  CLOSE c_dialog_service_center; 
+	
+	cout<<setw(8)<<i<<" med_dialog_service_centers loaded."<<endl;
+	f_log<<setw(8)<<i<<" med_dialog_service_centers loaded."<<endl;
+}
+
+
+void dyn_7_udr::db_read_med_local_service_centers()
+{
+	EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error - db_read_med_local_service_centers()");
+
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct local_service_center 
+	{ 
+		char	service_center[BUF_LEN]; 
+	} a, *local_service_center_ptr; 
+
+	int i;
+	EXEC SQL END DECLARE SECTION;
+	
+	local_service_center_ptr = &a;
+	
+	EXEC SQL  DECLARE c_local_service_center CURSOR FOR 
+		SELECT SERVICE_CENTER
+		FROM MED_LOCAL_SERVICE_CENTERS; 
+	
+	EXEC SQL OPEN   c_local_service_center; 
+	
+	EXEC SQL WHENEVER NOT FOUND DO break; 
+	
+	for (i=0; ;i++) 
+	{ 
+		EXEC SQL FETCH c_local_service_center INTO :local_service_center_ptr; 
+		insert_local_service_centers(local_service_center_ptr->service_center);
+	} 
+	
+	EXEC SQL  CLOSE c_local_service_center; 
+	
+	cout<<setw(8)<<i<<" med_local_service_centers loaded."<<endl;
+	f_log<<setw(8)<<i<<" med_local_service_centers loaded."<<endl;
+}
+
+
+void db_insert_dyn_7_udr(int cdr_count)
+{
+    EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error - db_insert_dyn_7_udr(int cdr_count)");
+
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	static struct db_cdr
+	{	
+		int		file_id;								//  number(9)
+		int		file_pos;								//	number(9)
+		char	originating_address[BUF_LEN];			//	varchar2(30)	- call_partner in dyn_1_udr
+		char	call_time[BUF_LEN];						//	date			- call_time in dyn_1_udr
+		char	traffic_event_time[BUF_LEN];			//	date			- call_time in dyn_1_udr
+		char	accept_time[BUF_LEN];					//	date			- call_time in dyn_1_udr
+		char	destination_imsi[BUF_LEN];				//	varchar2(30)	- imsi in dyn_1_udr
+		char	rate_call_partner[BUF_LEN];				//	varchar2(30)	- call_partner in dyn_1_udr
+		char	rate_call_type[BUF_LEN];				//	varchar2(10)	- "TERMI"
+		int		rate_sub_service_type;					//	number(2)
+		char	mediated_time[BUF_LEN];					//	date			- sysdate
+	} * a;
+
+	char	med_system_date[20]; 
+
+	int rows_to_insert;
+	
+	EXEC SQL END DECLARE SECTION;
+	
+	rows_to_insert = cdr_count;
+	
+	if((a = new db_cdr[array_insert_size])==NULL)
+	{
+		cout<<" cant allocate memory for cdr insert"<<endl;
+		exit(0);
+	}
+	
+	
+	for(int j=0; j<array_insert_size; j++)
+	{
+		a[j].file_pos = 0;
+	}
+	
+	for(int i=0; i<rows_to_insert; i++)
+	{
+		a[i].file_id			= gsm_dyn_7_udr_block[i].file_id; 
+		a[i].file_pos			= gsm_dyn_7_udr_block[i].file_pos;
+
+		strncpy(a[i].originating_address, gsm_dyn_7_udr_block[i].originating_address.c_str(), 30);
+		
+		reng_date d=gsm_dyn_7_udr_block[i].d_circuit_allocation_date;                                                                             
+		reng_time t=gsm_dyn_7_udr_block[i].d_circuit_allocation_time;                                                                             
+	    char buf[100];
+		buf[0] = '\0';                                                                                                                      
+	    sprintf(buf,"%02d%s%02d%s%04d%s%02d%s%02d%s%02d",d.day,"/",d.month,"/",d.year," ",t.hour,":",t.min,":",t.second);                   
+	    strcpy(a[i].call_time, buf);
+		strcpy(a[i].traffic_event_time, buf);
+		strcpy(a[i].accept_time, buf);      	
+							
+		strncpy(a[i].destination_imsi,	gsm_dyn_7_udr_block[i].destination_IMSI.c_str(), 30);				
+		
+		strncpy(a[i].rate_call_partner, gsm_dyn_7_udr_block[i].rate_call_partner.c_str(), 30);				
+		strncpy(a[i].rate_call_type,	gsm_dyn_7_udr_block[i].rate_call_type.c_str(), 10);						
+		a[i].rate_sub_service_type		=gsm_dyn_7_udr_block[i].rate_sub_service_type;
+
+		//EXEC SQL
+		//select sysdate into :a[i].mediated_time from dual;
+
+		
+		if ( (strcmp(debug_option,"ON"))==0 )
+		{					
+			cout <<"file_id						:" << a[i].file_id 					<<"|"<< endl;
+			cout <<"file_pos					:" << a[i].file_pos 				<<"|"<< endl;
+			cout <<"originating_address			:" << a[i].originating_address		<<"|"<< endl;
+			cout <<"call_time					:" << a[i].traffic_event_time		<<"|"<< endl;
+			cout <<"traffic_event_time			:" << a[i].call_time				<<"|"<< endl;
+			cout <<"accept_time					:" << a[i].accept_time				<<"|"<< endl;
+			cout <<"destination_imsi			:" << a[i].destination_imsi			<<"|"<< endl;
+
+			cout <<"rate_call_partner			:" << a[i].rate_call_partner		<<"|"<< endl;				
+			cout <<"rate_call_type				:" << a[i].rate_call_type			<<"|"<< endl;					
+			cout <<"rate_sub_service_type		:" << a[i].rate_sub_service_type	<<"|"<< endl;
+			//cout <<"mediated_time				:" << a[i].mediated_time			<<"|"<< endl;
+		}
+	}
+
+	EXEC SQL
+	select sysdate into :med_system_date from dual;
+	
+	for(int k=0; k<array_insert_size; k++)
+	{
+		strcpy(a[k].mediated_time, med_system_date);
+	} 
+
+	EXEC SQL  FOR :rows_to_insert  INSERT INTO DYN_7_UDR 
+	(
+		file_id,
+		file_pos,
+		originating_address,
+		call_time,
+		traffic_event_time,	
+		accept_time,					
+		destination_imsi,
+		rate_call_partner,
+		rate_call_type_id,
+		rate_sub_service_type,
+		mediated_time
+	) 
+	VALUES (:a);
+	
+	EXEC SQL COMMIT;
+	delete a;
+}
+
+
+void cdr_files::db_insert_sys_smsc_secondary(cdr_file_statistics s, cdr_file_statistics s_sms)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct cdr_file_t
+	{ 
+		char file_name[BUF_LEN];				//	varchar2(100)
+		int valid_cdr_count;					//  number(7)
+		int error_count;						//	number(7)
+		int bytes_read;							//	number(9)
+		char first_cdr_date[BUF_LENTH];			//	date
+		char last_cdr_date[BUF_LENTH];			//	date
+		char transfer_date[BUF_LEN];			//	date
+
+		int id_no;								//	number(9)
+ 	} a; 
+
+	EXEC SQL END DECLARE SECTION;
+
+	 cout << "a.id_no :" <<a.id_no<<endl;
+	 cout <<"s.file_id : "<<s.file_id<<endl;
+	 a.id_no = s.file_id;
+	 a.id_no *= -1;				// indicate  from r4 mediation engine
+	 cout << "a.id_no :" <<a.id_no<<endl;
+	 cout <<"s.file_id : "<<s.file_id<<endl;
+
+	 strcpy(a.file_name, s.file_name.c_str());
+	 a.valid_cdr_count = s_sms.valid_cdr_count;
+	 a.error_count = s_sms.error_count;
+	 a.bytes_read = s.bytes_read;
+	 strcpy(a.first_cdr_date, s_sms.first_cdr_date.c_str());
+	 strcpy(a.last_cdr_date, s_sms.last_cdr_date.c_str());
+	  strcpy(a.transfer_date, s.transfer_date.c_str());
+
+
+	 EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error: in db_insert_sys_smsc_secondary()");
+
+	 EXEC SQL
+	 INSERT INTO sys_smsc_secondary_dump_files 
+	(
+		cdr_file_id_no,
+		file_name,
+		valid_cdr_count, 
+		error_count,
+		bytes_read,
+		first_cdr_date,
+		last_cdr_date,
+		decoded_date,
+		transfer_date
+	) 
+	VALUES 
+	(
+		:a.id_no,
+		:a.file_name,
+		:a.valid_cdr_count, 
+		:a.error_count,
+		:a.bytes_read,
+		 to_date(:a.first_cdr_date,'YYYYMMDDHH24MISS'),
+		 to_date(:a.last_cdr_date,'YYYYMMDDHH24MISS'),
+		 SYSDATE,
+		to_date(:a.transfer_date,'DD/MM/YYYY HH24:MI:SS')
+	);
+
+	 EXEC SQL COMMIT;
+ 
+    printf("\n sys_smsc_secondary_dump_files file id=%d log inserted.\n\n", s.file_id);
+
+}
+
+void db_insert_non_charging_cdr(int cdr_count)
+{
+	EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error - db_insert_non_charging_cdr(int cdr_count)");
+
+	EXEC SQL BEGIN DECLARE SECTION;
+	
+	static struct db_cdr
+	{
+		char imsi[BUF_LEN]; 						//	varchar2(20)
+		char call_type_id[BUF_LEN];					//	varchar2(10)
+		char day_type_id[1];						//	varchar2(5)
+		char bearer_capability[BUF_LEN];			//	varchar2(10)
+		char region_code_id[1];						// varchar2(5)
+		char imei[BUF_LEN]; 						//  varchar2(20)
+		char network_group_id[1];					//	varchar2(5)
+		int locale_id;								//	number(3)
+		int cell_id; 								// number(5)
+		int duration;								//	number(9)
+		char route_group_id[1];						//	varchar2(5)
+ 		char network_id[BUF_LEN];					//	varchar2(5)
+		char msc_identity[BUF_LEN]; 				//	varchar2(20)
+		char mnc[BUF_LEN];							// varchar2(3)
+		int lac;									// number(5)
+		int termination_type;						//	number(3)
+		char call_partner[BUF_LEN];					//	varchar2(20)
+		char link_information[BUF_LEN];				// varchar2(20)
+		char ms_location[BUF_LEN];					//	varchar2(20)
+		int bearer_service; 						//	number(3)
+		int charging_indicator; 					// number(2)
+		char mcc[BUF_LEN];							// varchar2(5)
+		int service_type_id;						//	number(3)
+		int file_id;								//  number(9)
+		int file_pos;								//	number(9)
+		char call_time[BUF_LEN];					//	date
+		int roam;									//  number(1)
+		int call_partner_ext;						//  number(3)
+		char	mediated_time[BUF_LEN];				//	date			- sysdate
+	} *a;
+	
+	char	med_system_date[20]; 
+	
+	int rows_to_insert;
+	
+	EXEC SQL END DECLARE SECTION;
+	rows_to_insert = cdr_count;
+	
+	if((a = new db_cdr[array_insert_size])==NULL)
+	{
+		cout<<" cant allocate memory for cdr insert"<<endl;
+		exit(0);
+	}
+	
+	
+	for(int j=0; j<array_insert_size; j++)
+	{
+		a[j].file_pos = 0;
+	}
+	
+	for(int i=0; i<rows_to_insert; i++)
+	{
+		strcpy(a[i].imsi, gsm_no_charge_cdr_block[i].mobile_subscriber_identity.substr(0,20).c_str());          
+		strcpy(a[i].call_type_id,  gsm_no_charge_cdr_block[i].call_type_id.c_str());   
+		a[i].day_type_id[0]='\0';
+		strcpy(a[i].bearer_capability, gsm_no_charge_cdr_block[i].required_bearer_capability.c_str());
+		a[i].region_code_id[0]='\0';
+		strcpy(a[i].imei, gsm_no_charge_cdr_block[i].mobile_station_identity.substr(0,20).c_str());  
+		a[i].network_group_id[0]='\0';
+		a[i].locale_id = gsm_no_charge_cdr_block[i].origin_of_call_indicator;  
+		a[i].cell_id = gsm_no_charge_cdr_block[i].ci;
+		a[i].duration = gsm_no_charge_cdr_block[i].call_duration;
+		a[i].route_group_id[0]='\0';
+		strcpy(a[i].network_id, gsm_no_charge_cdr_block[i].call_partner_network_id.substr(0,5).c_str());  
+		strcpy(a[i].msc_identity, gsm_no_charge_cdr_block[i].msc_identity.substr(0,20).c_str());
+		strcpy(a[i].mnc, gsm_no_charge_cdr_block[i].mnc.c_str());                                                                                     
+	    a[i].lac = gsm_no_charge_cdr_block[i].lac;
+		a[i].termination_type  = gsm_no_charge_cdr_block[i].call_termination_type;
+		strcpy(a[i].call_partner,gsm_no_charge_cdr_block[i].db_call_partner_identity.substr(0,20).c_str()); 
+		strcpy(a[i].link_information, gsm_no_charge_cdr_block[i].link_information.c_str());
+		strcpy(a[i].ms_location, gsm_no_charge_cdr_block[i].ms_location_identity.substr(0,20).c_str() );
+		a[i].bearer_service = gsm_no_charge_cdr_block[i].required_bearer_service;
+		a[i].charging_indicator = gsm_no_charge_cdr_block[i].charging_indicator; 
+		strcpy(a[i].mcc, gsm_no_charge_cdr_block[i].mcc.c_str()); 
+		a[i].service_type_id = gsm_no_charge_cdr_block[i].int_decoded_service;
+		a[i].file_id =  gsm_no_charge_cdr_block[i].file_id;                                                                                           
+	    a[i].file_pos = gsm_no_charge_cdr_block[i].file_pos;  
+
+		reng_date d=gsm_no_charge_cdr_block[i].d_circuit_allocation_date;                                                                             
+		reng_time t=gsm_no_charge_cdr_block[i].d_circuit_allocation_time;                                                                             
+	    char buf[100];                                                                                                                      
+	    sprintf(buf,"%02d%s%02d%s%04d%s%02d%s%02d%s%02d",d.day,"/",d.month,"/",d.year," ",t.hour,":",t.min,":",t.second);                   
+	    strcpy(a[i].call_time, buf);      
+
+		a[i].roam =   gsm_no_charge_cdr_block[i].roam; 
+		a[i].call_partner_ext = gsm_no_charge_cdr_block[i].true_cpe;
+
+		//EXEC SQL
+		//select sysdate into :a[i].mediated_time from dual;
+
+
+		if ( (strcmp(debug_option,"ON"))==0 )
+		{
+			cout <<"imsi			:" << a[i].imsi 				<< endl;
+			cout <<"call_type_id	:" << a[i].call_type_id 		<< endl;
+			cout <<"day_type_id		:" << a[i].day_type_id 			<< "should be null"	<<	endl;
+			cout <<"bearer_capability:"<< a[i].bearer_capability	<< endl;
+			cout <<"region_code_id	:" << a[i].region_code_id		<< "should be null"	<<	endl;
+			cout <<"imei			:" << a[i].imei					<< endl;
+			cout <<"network_group_id:" << a[i].network_group_id		<< "should be null"	<<	endl;
+			cout <<"locale_id		:" << a[i].locale_id			<< endl;
+			cout <<"cell_id			:" << a[i].cell_id				<< endl;
+			cout <<"duration		:" << a[i].duration				<< endl;
+			cout <<"route_group_id	:" << a[i].route_group_id		<< "should be null"	<<	endl;
+			cout <<"network_id		:" << a[i].network_id			<< endl;
+			cout <<"msc_identity	:" << a[i].msc_identity			<< endl;
+			cout <<"mnc				:" << a[i].mnc					<< endl;
+			cout <<"lac				:" << a[i].lac					<< endl;
+			cout <<"termination_type:" << a[i].termination_type		<< endl;
+			cout <<"call_Partner	:" << a[i].call_partner			<< endl;
+			cout <<"link_information:" << a[i].link_information 	<< endl;
+			cout <<"ms_location		:" << a[i].ms_location			<< endl;
+			cout <<"bearer_service	:" << a[i].bearer_service		<< endl;
+			cout <<"charging_indicator	:" << a[i].charging_indicator		<< endl;
+			cout <<"mcc				:" << a[i].mcc					<< endl;
+			cout <<"service_type_id	:" << a[i].service_type_id		<< endl;
+			cout <<"file_id			:" << a[i].file_id				<< endl;
+			cout <<"file_pos		:" << a[i].file_pos				<< endl;
+			cout <<"call_time		:" << a[i].call_time			<< endl;
+			cout <<"roam			:" << a[i].roam					<< endl;
+			cout <<"call_partner_ext:" << a[i].call_partner_ext		<< endl;
+			//cout <<"mediated_time	:" << a[i].mediated_time		<< endl;
+		}
+	}
+
+	EXEC SQL
+	select sysdate into :med_system_date from dual;
+	
+	for(int k=0; k<array_insert_size; k++)
+	{
+		strcpy(a[k].mediated_time, med_system_date);
+	} 
+
+	EXEC SQL  FOR :rows_to_insert  INSERT INTO NON_CHARGING_CDR (
+		imsi, 
+		call_type_id, 
+		day_type_id, 
+		bearer_capability, 
+		region_code_id, 
+		imei, 
+		network_group_id, 
+		locale_id, 
+		cell_id, 
+		duration, 
+		route_group_id, 
+		network_id, 
+		msc_identity, 
+		mnc, 
+		lac, 
+		termination_type, 
+		call_partner, 
+		link_information, 
+		ms_location, 
+		bearer_service, 
+		charging_indicator, 
+		mcc, 
+		service_type_id, 
+		file_id, 
+		file_pos, 
+		call_time, 
+		roam,
+		call_partner_ext,
+		mediated_time
+	) VALUES (:a);
+	
+	
+	EXEC SQL COMMIT;
+	delete a;
+	
+}
+
+void db_insert_cdr_error_reason(int cdr_count)
+{
+	EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error - db_insert_rated_cdr(int cdr_count)");
+
+	EXEC SQL BEGIN DECLARE SECTION;
+	
+	static struct db_cdr
+	{
+		char imsi[BUF_LEN]; 						//	varchar2(20)
+		char call_type_id[BUF_LEN];					//	varchar2(10)
+		char day_type_id[1];						//	varchar2(5)
+		char bearer_capability[BUF_LEN];			//	varchar2(10)
+		char region_code_id[1];						// varchar2(5)
+		char imei[BUF_LEN]; 						//  varchar2(20)
+		char network_group_id[1];					//	varchar2(5)
+		int locale_id;								//	number(3)
+		int cell_id; 								// number(5)
+		int duration;								//	number(9)
+		char route_group_id[1];						//	varchar2(5)
+ 		char network_id[BUF_LEN];					//	varchar2(5)
+		char msc_identity[BUF_LEN]; 				//	varchar2(20)
+		char mnc[BUF_LEN];							// varchar2(3)
+		int lac;									// number(5)
+		int termination_type;						//	number(3)
+		char call_partner[BUF_LEN];					//	varchar2(20)
+		char link_information[BUF_LEN];				// varchar2(20)
+		char ms_location[BUF_LEN];					//	varchar2(20)
+		int bearer_service; 						//	number(3)
+		int charging_indicator; 					// number(2)
+		char mcc[BUF_LEN];							// varchar2(5)
+		int service_type_id;						//	number(3)
+		int file_id;								//  number(9)
+		int file_pos;								//	number(9)
+		char call_time[BUF_LEN];					//	date
+		int roam;									//  number(1)
+		int call_partner_ext;						//  number(3)
+		char error_reason[BUF_LEN];					//	varchar2(20)
+		char corrected[BUF_LEN];					//	varchar2(1)
+		char	mediated_time[BUF_LEN];				//	date			- sysdate
+	} *a;
+	
+	char	med_system_date[20]; 
+	
+	int rows_to_insert;
+	
+	EXEC SQL END DECLARE SECTION;
+	rows_to_insert = cdr_count;
+	
+	if((a = new db_cdr[array_insert_size])==NULL)
+	{
+		cout<<" cant allocate memory for cdr insert"<<endl;
+		exit(0);
+	}
+	
+	
+	for(int j=0; j<array_insert_size; j++)
+	{
+		a[j].file_pos = 0;
+	}
+	
+	for(int i=0; i<rows_to_insert; i++)
+	{
+		strcpy(a[i].imsi, gsm_error_cdr_block[i].mobile_subscriber_identity.substr(0,20).c_str());          
+		strcpy(a[i].call_type_id,  gsm_error_cdr_block[i].call_type_id.c_str());   
+		a[i].day_type_id[0]='\0';
+		strcpy(a[i].bearer_capability, gsm_error_cdr_block[i].required_bearer_capability.c_str());
+		a[i].region_code_id[0]='\0';
+		strcpy(a[i].imei, gsm_error_cdr_block[i].mobile_station_identity.substr(0,20).c_str());  
+		a[i].network_group_id[0]='\0';
+		a[i].locale_id = gsm_error_cdr_block[i].origin_of_call_indicator;  
+		a[i].cell_id = gsm_error_cdr_block[i].ci;
+		a[i].duration = gsm_error_cdr_block[i].call_duration;
+		a[i].route_group_id[0]='\0';
+		strcpy(a[i].network_id, gsm_error_cdr_block[i].call_partner_network_id.substr(0,5).c_str());  
+		strcpy(a[i].msc_identity, gsm_error_cdr_block[i].msc_identity.substr(0,20).c_str());
+		strcpy(a[i].mnc, gsm_error_cdr_block[i].mnc.c_str());                                                                                     
+	    a[i].lac = gsm_error_cdr_block[i].lac;
+		a[i].termination_type  = gsm_error_cdr_block[i].call_termination_type;
+		strcpy(a[i].call_partner,gsm_error_cdr_block[i].db_call_partner_identity.substr(0,20).c_str()); 
+		strcpy(a[i].link_information, gsm_error_cdr_block[i].link_information.c_str());
+		strcpy(a[i].ms_location, gsm_error_cdr_block[i].ms_location_identity.substr(0,20).c_str() );
+		a[i].bearer_service = gsm_error_cdr_block[i].required_bearer_service;
+		a[i].charging_indicator = gsm_error_cdr_block[i].charging_indicator; 
+		strcpy(a[i].mcc, gsm_error_cdr_block[i].mcc.c_str()); 
+		a[i].service_type_id = gsm_error_cdr_block[i].int_decoded_service;
+		a[i].file_id =  gsm_error_cdr_block[i].file_id;                                                                                           
+	    a[i].file_pos = gsm_error_cdr_block[i].file_pos;  
+
+		reng_date d=gsm_error_cdr_block[i].d_circuit_allocation_date;                                                                             
+		reng_time t=gsm_error_cdr_block[i].d_circuit_allocation_time;                                                                             
+	    char buf[100];                                                                                                                      
+	    sprintf(buf,"%02d%s%02d%s%04d%s%02d%s%02d%s%02d",d.day,"/",d.month,"/",d.year," ",t.hour,":",t.min,":",t.second);                   
+	    strcpy(a[i].call_time, buf);      
+
+		a[i].roam =   gsm_error_cdr_block[i].roam; 
+		a[i].call_partner_ext = gsm_error_cdr_block[i].true_cpe;
+
+		//EXEC SQL
+		//select sysdate into :a[i].mediated_time from dual;
+
+
+		if ( (strcmp(debug_option,"ON"))==0 )
+		{
+			cout <<"imsi			:" << a[i].imsi 				<< endl;
+			cout <<"call_type_id	:" << a[i].call_type_id 		<< endl;
+			cout <<"day_type_id		:" << a[i].day_type_id 			<< "should be null"	<<	endl;
+			cout <<"bearer_capability:"<< a[i].bearer_capability	<< endl;
+			cout <<"region_code_id	:" << a[i].region_code_id		<< "should be null"	<<	endl;
+			cout <<"imei			:" << a[i].imei					<< endl;
+			cout <<"network_group_id:" << a[i].network_group_id		<< "should be null"	<<	endl;
+			cout <<"locale_id		:" << a[i].locale_id			<< endl;
+			cout <<"cell_id			:" << a[i].cell_id				<< endl;
+			cout <<"duration		:" << a[i].duration				<< endl;
+			cout <<"route_group_id	:" << a[i].route_group_id		<< "should be null"	<<	endl;
+			cout <<"network_id		:" << a[i].network_id			<< endl;
+			cout <<"msc_identity	:" << a[i].msc_identity			<< endl;
+			cout <<"mnc				:" << a[i].mnc					<< endl;
+			cout <<"lac				:" << a[i].lac					<< endl;
+			cout <<"termination_type:" << a[i].termination_type		<< endl;
+			cout <<"call_Partner	:" << a[i].call_partner			<< endl;
+			cout <<"link_information:" << a[i].link_information 	<< endl;
+			cout <<"ms_location		:" << a[i].ms_location			<< endl;
+			cout <<"bearer_service	:" << a[i].bearer_service		<< endl;
+			cout <<"charging_indicator	:" << a[i].charging_indicator		<< endl;
+			cout <<"mcc				:" << a[i].mcc					<< endl;
+			cout <<"service_type_id	:" << a[i].service_type_id		<< endl;
+			cout <<"file_id			:" << a[i].file_id				<< endl;
+			cout <<"file_pos		:" << a[i].file_pos				<< endl;
+			cout <<"call_time		:" << a[i].call_time			<< endl;
+			cout <<"roam			:" << a[i].roam					<< endl;
+			cout <<"call_partner_ext:" << a[i].call_partner_ext		<< endl;
+			//cout <<"mediated_time	:" << a[i].mediated_time		<< endl;
+		}
+	}
+
+	EXEC SQL
+	select sysdate into :med_system_date from dual;
+	
+	for(int k=0; k<array_insert_size; k++)
+	{
+		strcpy(a[k].mediated_time, med_system_date);
+	} 
+
+	EXEC SQL  FOR :rows_to_insert  INSERT INTO CDR_ERROR_REASON (
+		imsi, 
+		call_type_id, 
+		day_type_id, 
+		bearer_capability, 
+		region_code_id, 
+		imei, 
+		network_group_id, 
+		locale_id, 
+		cell_id, 
+		duration, 
+		route_group_id, 
+		network_id, 
+		msc_identity, 
+		mnc, 
+		lac, 
+		termination_type, 
+		call_partner, 
+		link_information, 
+		ms_location, 
+		bearer_service, 
+		charging_indicator, 
+		mcc, 
+		service_type_id, 
+		file_id, 
+		file_pos, 
+		call_time, 
+		roam,
+		call_partner_ext,
+		mediated_time
+	) VALUES (:a);
+	
+	
+	EXEC SQL COMMIT;
+	delete a;
+	
+}
+
+void db_read_med_threshold(int &no_charge_threshold)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	 int	threshold;				//	NUMBER(8)
+			 
+	EXEC SQL END DECLARE SECTION;
+
+	EXEC ORACLE OPTION (char_map=string) ;
+
+	EXEC SQL WHENEVER NOT FOUND DO sql_error("No relevant entry in MED_THRESHOLD table for description=NO_CHARGE"); 
+	EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error - db_read_med_threshold(int no_charge_threshold)");
+
+	EXEC SQL 
+	SELECT	THRESHOLD
+	INTO	:threshold 
+	FROM	MED_THRESHOLD
+	WHERE DESCRIPTION = 'NO_CHARGE';
+	
+	no_charge_threshold = threshold;
+}
+
+
+

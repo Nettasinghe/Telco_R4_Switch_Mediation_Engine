@@ -1,0 +1,17 @@
+mv call_partner_networks.cpp call_partner_networks.C
+mv cdr_buffer.cpp cdr_buffer.C             
+mv dev_history.cpp dev_history.C
+mv cdr_decode.cpp cdr_decode.C            
+mv identity.cpp identity.C
+mv cdr_file_locations.cpp cdr_file_locations.C    
+mv mediation.cpp mediation.C
+mv cdr_file_statistics.cpp cdr_file_statistics.C  
+mv cdr_files.cpp cdr_files.C             
+mv rated_cdr.cpp rated_cdr.C
+mv cdr_unpack.cpp cdr_unpack.C   
+mv reng_date_time.cpp reng_date_time.C
+mv code_decode.cpp code_decode.C           
+mv token.cpp token.C
+mv vm_call_partners.cpp vm_call_partners.C
+mv dyn_7_udr.cpp dyn_7_udr.C
+
